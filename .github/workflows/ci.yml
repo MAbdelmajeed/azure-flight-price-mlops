@@ -17,7 +17,12 @@ permissions:
 
 jobs:
 
+  # -------------------------------------------------
+  # 1. Continuous Integration
+  # -------------------------------------------------
+
   test:
+    name: Run automated tests
     runs-on: ubuntu-latest
 
     steps:
@@ -40,11 +45,18 @@ jobs:
           python -m pytest -v
 
 
+  # -------------------------------------------------
+  # 2. Azure ML training + quality gate
+  # -------------------------------------------------
+
   train:
+    name: Train and register approved model
+
     needs: test
 
-    # Train only after a push to main or a manual run.
-    # Pull requests run the CI tests but do not spend Azure compute.
+    # Pull requests run tests only.
+    # Azure training runs after pushes to main
+    # or when manually triggered.
     if: github.event_name != 'pull_request'
 
     runs-on: ubuntu-latest
@@ -66,8 +78,72 @@ jobs:
 
       - name: Submit Azure ML training job
         run: |
-          az ml job create \
+          JOB_NAME=$(az ml job create \
             --file azureml/train-job.yml \
             --resource-group aml-flight-price-mlops \
             --workspace-name aml-flight-price-mlops \
-            --stream
+            --query name \
+            --output tsv)
+
+          echo "JOB_NAME=$JOB_NAME" >> "$GITHUB_ENV"
+
+          echo "Azure ML job submitted:"
+          echo "$JOB_NAME"
+
+      - name: Stream Azure ML job
+        run: |
+          az ml job stream \
+            --name "$JOB_NAME" \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops
+
+      - name: Verify training and quality gate
+        run: |
+          STATUS=$(az ml job show \
+            --name "$JOB_NAME" \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops \
+            --query status \
+            --output tsv)
+
+          echo "Final Azure ML job status: $STATUS"
+
+          if [ "$STATUS" != "Completed" ]; then
+            echo "Training or model quality gate failed."
+            exit 1
+          fi
+
+          echo "Training completed and quality gate passed."
+
+      - name: Determine next model version
+        run: |
+          LATEST_VERSION=$(az ml model list \
+            --name flight-price-model \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops \
+            --query "[].version" \
+            --output tsv | sort -n | tail -1)
+
+          if [ -z "$LATEST_VERSION" ]; then
+            NEXT_VERSION=1
+          else
+            NEXT_VERSION=$((LATEST_VERSION + 1))
+          fi
+
+          echo "NEXT_VERSION=$NEXT_VERSION" >> "$GITHUB_ENV"
+
+          echo "Current latest version: ${LATEST_VERSION:-None}"
+          echo "New model version: $NEXT_VERSION"
+
+      - name: Register approved model
+        run: |
+          az ml model create \
+            --name flight-price-model \
+            --version "$NEXT_VERSION" \
+            --type custom_model \
+            --path "azureml://jobs/$JOB_NAME/outputs/artifacts/paths/outputs/model/" \
+            --description "Flight price model approved by automated CI and model quality gate." \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops
+
+          echo "Registered flight-price-model version $NEXT_VERSION"
