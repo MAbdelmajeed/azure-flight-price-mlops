@@ -1,4 +1,4 @@
-name: CI and Azure ML Training
+name: CI/CD and Azure ML MLOps
 
 on:
   push:
@@ -15,10 +15,11 @@ permissions:
   contents: read
   id-token: write
 
+
 jobs:
 
   # -------------------------------------------------
-  # 1. Continuous Integration
+  # 1. CONTINUOUS INTEGRATION
   # -------------------------------------------------
 
   test:
@@ -46,24 +47,34 @@ jobs:
 
 
   # -------------------------------------------------
-  # 2. Azure ML training + quality gate
+  # 2. TRAIN + QUALITY GATE + REGISTER + DEPLOY
   # -------------------------------------------------
 
-  train:
-    name: Train and register approved model
+  train-and-deploy:
+    name: Train, register and deploy approved model
 
     needs: test
 
     # Pull requests run tests only.
-    # Azure training runs after pushes to main
-    # or when manually triggered.
+    # Training and deployment run after a push to main
+    # or a manual workflow run.
     if: github.event_name != 'pull_request'
 
     runs-on: ubuntu-latest
 
     steps:
+
+      # -------------------------------------------------
+      # Repository
+      # -------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # -------------------------------------------------
+      # Azure authentication
+      # -------------------------------------------------
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -72,9 +83,19 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+
+      # -------------------------------------------------
+      # Azure ML CLI
+      # -------------------------------------------------
+
       - name: Install Azure ML CLI
         run: |
           az extension add --name ml --yes
+
+
+      # -------------------------------------------------
+      # Submit Azure ML training job
+      # -------------------------------------------------
 
       - name: Submit Azure ML training job
         run: |
@@ -90,12 +111,22 @@ jobs:
           echo "Azure ML job submitted:"
           echo "$JOB_NAME"
 
+
+      # -------------------------------------------------
+      # Stream Azure ML job
+      # -------------------------------------------------
+
       - name: Stream Azure ML job
         run: |
           az ml job stream \
             --name "$JOB_NAME" \
             --resource-group aml-flight-price-mlops \
             --workspace-name aml-flight-price-mlops
+
+
+      # -------------------------------------------------
+      # Verify training + quality gate
+      # -------------------------------------------------
 
       - name: Verify training and quality gate
         run: |
@@ -114,6 +145,11 @@ jobs:
           fi
 
           echo "Training completed and quality gate passed."
+
+
+      # -------------------------------------------------
+      # Determine next model version
+      # -------------------------------------------------
 
       - name: Determine next model version
         run: |
@@ -135,6 +171,11 @@ jobs:
           echo "Current latest version: ${LATEST_VERSION:-None}"
           echo "New model version: $NEXT_VERSION"
 
+
+      # -------------------------------------------------
+      # Register approved model
+      # -------------------------------------------------
+
       - name: Register approved model
         run: |
           az ml model create \
@@ -147,3 +188,119 @@ jobs:
             --workspace-name aml-flight-price-mlops
 
           echo "Registered flight-price-model version $NEXT_VERSION"
+
+
+      # -------------------------------------------------
+      # Prepare deployment YAML
+      # -------------------------------------------------
+
+      - name: Prepare deployment configuration
+        run: |
+          cp azureml/deployment.yml azureml/deployment-ci.yml
+
+          sed -i "s/MODEL_VERSION/$NEXT_VERSION/g" azureml/deployment-ci.yml
+
+          echo "Deployment configuration:"
+          cat azureml/deployment-ci.yml
+
+
+      # -------------------------------------------------
+      # Ensure endpoint exists
+      # -------------------------------------------------
+
+      - name: Ensure online endpoint exists
+        run: |
+          if az ml online-endpoint show \
+            --name flight-price-endpoint \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops \
+            > /dev/null 2>&1; then
+
+            echo "Online endpoint already exists."
+
+          else
+
+            echo "Online endpoint does not exist. Creating it."
+
+            az ml online-endpoint create \
+              --file azureml/endpoint.yml \
+              --resource-group aml-flight-price-mlops \
+              --workspace-name aml-flight-price-mlops
+
+          fi
+
+
+      # -------------------------------------------------
+      # Create or update deployment
+      # -------------------------------------------------
+
+      - name: Deploy approved model
+        run: |
+          if az ml online-deployment show \
+            --name blue \
+            --endpoint-name flight-price-endpoint \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops \
+            > /dev/null 2>&1; then
+
+            echo "Updating blue deployment to model version $NEXT_VERSION."
+
+            az ml online-deployment update \
+              --name blue \
+              --endpoint-name flight-price-endpoint \
+              --file azureml/deployment-ci.yml \
+              --resource-group aml-flight-price-mlops \
+              --workspace-name aml-flight-price-mlops
+
+          else
+
+            echo "Creating blue deployment with model version $NEXT_VERSION."
+
+            az ml online-deployment create \
+              --name blue \
+              --endpoint-name flight-price-endpoint \
+              --file azureml/deployment-ci.yml \
+              --resource-group aml-flight-price-mlops \
+              --workspace-name aml-flight-price-mlops \
+              --all-traffic
+
+          fi
+
+
+      # -------------------------------------------------
+      # Ensure traffic goes to blue
+      # -------------------------------------------------
+
+      - name: Route traffic to blue deployment
+        run: |
+          az ml online-endpoint update \
+            --name flight-price-endpoint \
+            --traffic "blue=100" \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops
+
+          echo "100% of endpoint traffic routed to blue."
+
+
+      # -------------------------------------------------
+      # Smoke test
+      # -------------------------------------------------
+
+      - name: Smoke test online endpoint
+        run: |
+          RESPONSE=$(az ml online-endpoint invoke \
+            --name flight-price-endpoint \
+            --deployment-name blue \
+            --request-file sample-request.json \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops)
+
+          echo "Endpoint response:"
+          echo "$RESPONSE"
+
+          if echo "$RESPONSE" | grep -q "predictions"; then
+            echo "Smoke test passed."
+          else
+            echo "Smoke test failed."
+            exit 1
+          fi
