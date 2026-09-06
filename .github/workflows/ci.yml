@@ -1,4 +1,4 @@
-name: CI
+name: CI and Azure ML Training
 
 on:
   push:
@@ -11,7 +11,12 @@ on:
 
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
+
   test:
     runs-on: ubuntu-latest
 
@@ -33,3 +38,36 @@ jobs:
       - name: Run tests
         run: |
           python -m pytest -v
+
+
+  train:
+    needs: test
+
+    # Train only after a push to main or a manual run.
+    # Pull requests run the CI tests but do not spend Azure compute.
+    if: github.event_name != 'pull_request'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure ML CLI
+        run: |
+          az extension add --name ml --yes
+
+      - name: Submit Azure ML training job
+        run: |
+          az ml job create \
+            --file azureml/train-job.yml \
+            --resource-group aml-flight-price-mlops \
+            --workspace-name aml-flight-price-mlops \
+            --stream
