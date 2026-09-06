@@ -10,11 +10,21 @@ code: ../src
 command: >-
   python train.py
   --data ${{inputs.training_data}}
+  &&
+  python quality_gate.py
+  --metrics outputs/metrics.json
+  --min-r2 ${{inputs.min_r2}}
+  --max-mae ${{inputs.max_mae}}
+  --max-rmse ${{inputs.max_rmse}}
 
 inputs:
   training_data:
     type: uri_file
     path: azureml:flight-price-data:1
+
+  min_r2: 0.95
+  max_mae: 2500
+  max_rmse: 4500
 
 environment:
   image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest
