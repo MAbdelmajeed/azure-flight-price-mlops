@@ -1,0 +1,23 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+type: command
+
+display_name: flight-price-baseline
+experiment_name: flight-price-regression
+
+code: ../src
+
+command: >-
+  python train.py
+  --data ${{inputs.training_data}}
+
+inputs:
+  training_data:
+    type: uri_file
+    path: azureml:flight-price-data:1
+
+environment:
+  image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest
+  conda_file: environment.yml
+
+compute: azureml:cpu-cluster
